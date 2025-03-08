@@ -17,7 +17,7 @@ template <GemmType kGemmType,
           uint32_t kNumNBlocksPerGroup = 16>
 struct Scheduler {
     int current_iter = -1;
-    uint32_t num_aligned_m_blocks;
+    uint32_t num_aligned_m_blocks; // m维度上的分块数量
 
     // For normal GEMM
     // Maybe not used in the masked grouped GEMM
@@ -42,16 +42,27 @@ struct Scheduler {
         }
     }
 
+    // 使用 grouped ordering, 提高L2 cache命中率
+    // 参考 triton tutorial: https://triton-lang.org/main/getting-started/tutorials/03-matrix-multiplication.html#sphx-glr-getting-started-tutorials-03-matrix-multiplication-py
     __device__ __forceinline__ void get_swizzled_block_idx(const uint32_t num_m_blocks, int block_idx, uint32_t& m_block_idx, uint32_t& n_block_idx) {
         DG_STATIC_ASSERT(kNumNBlocksPerGroup % kNumTMAMulticast == 0, "Invalid group size");
 
         // Swizzle for better L2 usages
+        // num_m_blocks: m方向的block数量
+        // kNumNBlocksPerGroup: 每个group中的N block数量
+        // num_blocks_per_group: 每个group中的block数量 (这里只在N方向划分group, m方向上不划分group)
         auto num_blocks_per_group = num_m_blocks * kNumNBlocksPerGroup;
+        // group_idx: 当前group的索引
         auto group_idx = block_idx / num_blocks_per_group;
+        // first_n_block_idx: 当前group中第一个block在N方向上的索引
         auto first_n_block_idx = group_idx * kNumNBlocksPerGroup;
+        // num_n_blocks_in_group: 当前group中N block的数量
         auto num_n_blocks_in_group = min(kNumNBlocksPerGroup, kNumNBlocks - first_n_block_idx);
+        // in_group_idx: 当前block在group中的索引
         auto in_group_idx = block_idx % num_blocks_per_group;
+        // m_block_idx: 当前block在group内的m方向索引, 由于不在m方向划分group, 因此也是全局的m索引
         m_block_idx = in_group_idx / num_n_blocks_in_group;
+        // n_block_idx: 当前block的全局n索引
         n_block_idx = first_n_block_idx + in_group_idx % num_n_blocks_in_group;
     }
 
@@ -69,6 +80,7 @@ struct Scheduler {
     }
 
     __device__ __forceinline__ bool get_next_block(uint32_t& m_block_idx, uint32_t& n_block_idx) {
+        // 采用persistent kernel, gridDim.x固定是num_sms
         const auto next_block_idx = (++ current_iter) * gridDim.x + blockIdx.x;
 
         if constexpr (kGemmType == GemmType::GroupedMasked) {

@@ -14,6 +14,8 @@
 #include "tma_utils.cuh"
 #include "utils.cuh"
 
+#define __CLION_IDE__ 1 // For view
+
 namespace deep_gemm {
 
 enum class Layout {
@@ -43,6 +45,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 900)) or defined(__CLION_IDE__)
     // Scaling checks
     DG_STATIC_ASSERT(BLOCK_K == 128, "Only support per-128-channel FP8 scaling");
+    // 隐含 BLOCK_N <= BLOCK_K, 也就是 BLOCK_N <= 128, 这样每个block只需要加载1个scale
     DG_STATIC_ASSERT(ceil_div(BLOCK_N, BLOCK_K) == 1, "Too much B scales in a single block");
 
     // Types
@@ -50,6 +53,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
 
     // Shared memory
+    // BLOCK_N 是否在一个完整的 128  (这里有点问题, 比如 BLOCK_N = 24 时, 虽然128 % 24 != 0, 但N也有可能刚好落在一个完整的128块内)
     static constexpr int kMustUseUniformedScaleB = (BLOCK_K % BLOCK_N == 0);
     static constexpr uint32_t SMEM_D_SIZE = BLOCK_M * BLOCK_N * sizeof(__nv_bfloat16);
     static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
@@ -59,6 +63,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     static constexpr uint32_t SMEM_SCALES_B_SIZE = ceil_div<uint32_t>(SHAPE_K_SCALES * (kMustUseUniformedScaleB ? 1 : 2) * sizeof(float), sizeof(Barrier)) * sizeof(Barrier);
 
     // Configs
+    // 每个iter能处理的K数量
     constexpr uint32_t kFullKOfAllStages = kNumStages * BLOCK_K;
     constexpr uint32_t kNumThreads = get_num_threads_per_sm<kNumTMAThreads, kNumMathThreadsPerGroup>(BLOCK_M);
     constexpr uint32_t kNumMathThreads = kNumThreads - kNumTMAThreads;
@@ -87,7 +92,21 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     float* smem_scales_b;
 
     // TMA Barrier for both divisible and non-divisible cases
+    // 生产者-消费者模型的barrier
+
+    // wait相当于P操作, -1
+    // arrive相当于V操作, +1
+
+    // full_barriers 表示当前stage的A和B已经加载完成, 可以开始计算
+    // Math是consumer 会调用 full_barriers[i].wait()
+    // TMA是producer 会调用 full_barriers[i].arrive()
+    // 初始值设置: 1 (为什么是1而不是0 ?)
     Barrier* full_barriers[kNumStages];
+
+    // empty_barriers 表示当前stage的A和B已经计算完成, 可以开始加载下一个stage的A和B
+    // TMA是consumer 会调用 empty_barriers[i].wait()
+    // Math是producer 会调用 empty_barriers[i].arrive()
+    // 初始值设置: kNumTMAMulticast * kNumMathThreads / 32 (为什么是这个?)
     Barrier* empty_barriers[kNumStages];
 
     // Fill shared memory pointers
@@ -129,11 +148,14 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
     // For pipeline unrolling
     struct DivisibleK {};
     struct NotDivisibleK {};
+    // k维度的iter循环, 用于TMA和计算
     auto launch_k_iterations = [](const auto& func) {
         if constexpr (SHAPE_K % kFullKOfAllStages == 0) {
+            // 刚好整除
             for (int k_iter = 0; k_iter < kNumIterations; ++ k_iter)
                 func(k_iter, DivisibleK{});
         } else {
+            // 无法整除, 额外多一次
             for (int k_iter = 0; k_iter < kNumIterations - 1; ++ k_iter)
                 func(k_iter, DivisibleK{});
             func(kNumIterations - 1, NotDivisibleK{});
@@ -153,6 +175,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         cutlass::arch::warpgroup_reg_dealloc<kNumTMARegisters>();
 
         // NOTES: only one thread (or warp) will be used
+        // TMA只需要一个线程, 所以其中的full_barrier.arrive操作没有限制lane_id
         if (threadIdx.x == kNumMathThreads) {
             // Persistently schedule over blocks
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
@@ -166,6 +189,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                     #pragma unroll
                     for (uint32_t s = 0; s < kNumInnerStages; ++ s) {
                         // Wait consumer release
+                        // 交替使用0和1，区别不同iter中的同步点
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
 
                         // Issue TMA A with broadcasting
@@ -180,10 +204,14 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         // Issue TMA B without broadcasting
                         tma_copy(&tensor_map_b, reinterpret_cast<uint64_t*>(&full_barrier),
                                  smem_b[s], k_idx, scheduler.get_global_idx<false>(SHAPE_N, BLOCK_N, n_block_idx, m_block_idx));
+
+                        // tma_copy时传入了full_barrier, 每个tma_copy完成后都会执行full_barrier的complete_tx操作, 加起来刚好等于下面的参数
+                        // 也就是tma_copy是异步指令, 通过full_barrier来监控tma_copy是否完成, 完成后再执行arrive
                         full_barrier.arrive_and_expect_tx(SMEM_A_SIZE_PER_STAGE + SMEM_B_SIZE_PER_STAGE + SMEM_SCALES_A_SIZE_PER_STAGE);
                     }
 
                     // Wait unaligned cases
+                    // 这里貌似是没数据的, 为什么还需要同步 (是为了和计算配合?)
                     #pragma unroll
                     for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
                         empty_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter + 1) & 1);
@@ -204,7 +232,12 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
 
         // NOTES: use `__shfl_sync` to encourage NVCC to use unified registers
+        // 将每个warp里lane_id=0的线程计算结果广播到所有线程, 这样可以鼓励nvcc使用统一寄存器(神奇)
+        // warp group的id
         const auto math_wg_idx = __shfl_sync(0xffffffff, threadIdx.x / kNumMathThreadsPerGroup, 0);
+
+        // 每个warp处理16行数据, 每4个线程共享1行数据, r_1是在r_0的下面8行, 也就是每个线程会处理2行数据中的一部分
+        // 据Claude-3.7说: 这行代码是精心设计的访存模式, 适配WGMMA指令的访存模式
         const auto r_0 = warp_idx * 16 + lane_idx / 4, r_1 = r_0 + 8;
 
         // Persistently schedule over blocks
@@ -212,6 +245,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             // Decide the number of scales B to load
             DG_STATIC_ASSERT(SHAPE_N % 8 == 0, "Invalid shape N");
             uint32_t num_former_iters = BLOCK_N / 8, num_full_iters = num_former_iters;
+            // BLOCK_N 是否在一个完整的 128 块内
             if constexpr (not kMustUseUniformedScaleB) {
                 num_former_iters = min(BLOCK_N, BLOCK_K - n_block_idx * BLOCK_N % BLOCK_K) / 8;
                 num_full_iters = min(SHAPE_N - n_block_idx * BLOCK_N, BLOCK_N) / 8;
@@ -220,6 +254,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
             // Load B scales with math warp-groups
             // NOTES: except the first warp, we want to overlap loading B scales with TMA stores between tasks
+            // 这里的overlap从第一个block结束的TMA store和第二个block开始的Load B scales开始
             if (threadIdx.x >= 32) {
                 auto num_previous_lines = scheduler.get_global_idx<false>(ceil_div(SHAPE_N, BLOCK_K), 0, 0, m_block_idx);
                 auto local_scales_b = scales_b + (num_previous_lines + ((n_block_idx * BLOCK_N) / BLOCK_K)) * SHAPE_K_SCALES;
@@ -227,12 +262,18 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 for (uint32_t i = threadIdx.x - 32; i < num_scales_b; i += kNumMathThreads - 32)
                     st_shared(smem_scales_b + i, __ldg(local_scales_b + i));
             }
+            // kNumMathThreads 个线程同步
             cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 
             // Accumulation for WGMMA or CUDA promotion
+            // accum 用于 WGMMA
+            // final_accum 用于 promotion 结果
             float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
 
             // Empty barrier arrival
+            // - 当使用 TMA 多播时，多个 CTA 会同时处理相同的数据
+            // - 每个 CTA 中的每个 warp 都需要发出一个 arrive 信号
+            // - 总共需要 kNumTMAMulticast * (kNumMathThreads / 32) 个 arrive 操作
             auto empty_barrier_arrive = [&](int s) {
                 if constexpr (kNumTMAMulticast == 1) {
                     lane_idx == 0 ? empty_barriers[s]->arrive() : void();
@@ -260,12 +301,15 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
 
                     // Read A scales
                     // NOTES: all shared memory read must be prior to `warpgroup_arrive` to avoid next scheduled block polluting the results
+                    // 每个线程处理2行数据, 有2个scale_a
                     auto scale_a_0 = ld_shared(smem_scales_a[s] + r_0), scale_a_1 = ld_shared(smem_scales_a[s] + r_1);
 
                     // Commit WGMMA instructions
+                    // 对所有累加器寄存器应用内存屏障，防止编译器优化导致的重排序
                     #pragma unroll
                     for (int i = 0; i < WGMMA::kNumAccum; ++ i)
                         warpgroup_fence_operand(accum[i]);
+                    // 创建一个同步点，确保 warp 组内所有线程都到达此处
                     warpgroup_arrive();
                     #pragma unroll
                     for (int k = 0; k < BLOCK_K / WGMMA::K; ++ k) {
@@ -273,10 +317,12 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                         auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
                         WGMMA::wgmma(desc_a, desc_b, accum, k);
                     }
+                    // 提交wgmma指令
                     warpgroup_commit_batch();
                     #pragma unroll
                     for (int i = 0; i < WGMMA::kNumAccum; ++ i)
                         warpgroup_fence_operand(accum[i]);
+                    // 等待wgmma完成
                     warpgroup_wait<0>();
 
                     // Notify barrier arrival
@@ -299,6 +345,7 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
                 }
 
                 // Wait unaligned cases
+                // 这里也有对应的一段
                 #pragma unroll
                 for (uint32_t s = kNumInnerStages; s < kNumStages; ++ s) {
                     full_barriers[s]->wait((scheduler.current_iter * kNumIterations + k_iter) & 1);
@@ -307,9 +354,23 @@ fp8_gemm_kernel(__nv_bfloat16* gmem_d, float* scales_b, int* grouped_layout,
             });
 
             // Write back to shared memory using STSM
+            // kNumAccum 固定是 WGMMA::M * WGMMA::N / 128
             DG_STATIC_ASSERT(WGMMA::kNumAccum % 4 == 0, "Invalid STSM x2 vectorization");
-            #pragma unroll
+            #pragma unroll  
             for (auto i = 0; i < WGMMA::kNumAccum / 8; ++ i) {
+                // 每次循环每个线程处理8个数, 每个warp处理256个数, 也就是16 * 16的矩阵
+                // 使用stmatrix将4个8x8的matrix搬运到shared memory
+                // 4个8x8matrix一共有32行, 传入的地址是这32行的首地址
+                // - thread 0-7对应 0-7 行
+                // - thread 8-15对应 8-15 行
+                // - thread 16-23对应 16-23 行
+                // - thread 24-31对应 24-31 行
+                // shared memory中的地址:
+                // addr0  ...  addr16
+                // addr1  ...  addr17
+                // addr2  ...  addr18
+                // ...
+                // addr15 ...  addr31
                 SM90_U32x4_STSM_N<nv_bfloat162>::copy(
                     __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
                     __float22bfloat162_rn({final_accum[i * 8 + 2], final_accum[i * 8 + 3]}),
